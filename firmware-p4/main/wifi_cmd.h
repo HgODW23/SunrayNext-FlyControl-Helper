@@ -1,10 +1,12 @@
 #pragma once
 
+#include "esp_err.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-int console_app_init(void);
+esp_err_t wifi_cmd_register(void);
 
 #ifdef __cplusplus
 }

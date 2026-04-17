@@ -16,9 +16,12 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_netif_types.h"
+#include "esp_wifi_types_generic.h"
 
 /**
  * @brief WiFi 连接最大重试次数
@@ -33,6 +36,45 @@ extern "C" {
  * 断开后等待的时间再发起重连，避免打断 ESP32-C5 的连接流程。
  */
 #define WIFI_RETRY_DELAY_MS   3000
+
+#define WIFI_APP_MAX_SCAN_RESULTS 32
+
+typedef enum {
+    WIFI_APP_SECURITY_OPEN = 0,
+    WIFI_APP_SECURITY_WEP,
+    WIFI_APP_SECURITY_WPA,
+    WIFI_APP_SECURITY_WPA2,
+    WIFI_APP_SECURITY_WPA3,
+    WIFI_APP_SECURITY_UNKNOWN,
+} wifi_app_security_t;
+
+typedef struct {
+    char ssid[33];
+    int8_t rssi;
+    uint8_t channel;
+    uint8_t bssid[6];
+    wifi_app_security_t security;
+} wifi_app_scan_result_t;
+
+typedef struct {
+    const char *ssid;
+    const char *password;  // NULL or "" means open network.
+    const uint8_t *bssid;  // 6-byte BSSID, only used when use_bssid=true.
+    bool use_bssid;
+    uint32_t timeout_ms;   // 0 means default timeout.
+} wifi_app_connect_params_t;
+
+typedef struct {
+    wifi_mode_t mode;
+    bool started;
+    bool connected;
+    bool got_ip;
+    esp_netif_ip_info_t ip_info;
+    char ssid[33];
+    int8_t rssi;
+    uint8_t bssid[6];
+    uint8_t mac[6];
+} wifi_app_status_t;
 
 /**
  * @defgroup wifi_app WiFi Application
@@ -89,6 +131,24 @@ esp_err_t wifi_app_init(void);
  * @see wifi_app_deinit()
  */
 esp_err_t wifi_app_connect_with_creds(const char *ssid, const char *password);
+
+esp_err_t wifi_app_scan(wifi_app_scan_result_t *results, size_t max_results, size_t *out_count);
+
+esp_err_t wifi_app_connect(const wifi_app_connect_params_t *params);
+
+esp_err_t wifi_app_cancel_connect(void);
+
+esp_err_t wifi_app_disconnect(void);
+
+esp_err_t wifi_app_reconnect(void);
+
+esp_err_t wifi_app_get_status(wifi_app_status_t *out_status);
+
+esp_err_t wifi_app_get_mac(uint8_t out_mac[6]);
+
+esp_err_t wifi_app_set_mac_temporary(const uint8_t mac[6]);
+
+const char *wifi_app_security_to_string(wifi_app_security_t security);
 
 /**
  * @brief 获取当前 IP 地址信息

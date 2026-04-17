@@ -2,7 +2,7 @@ dependencies:
   cmd_system:
     dependencies: []
     source:
-      path: /Users/groove/.espressif/v5.5.3/esp-idf/examples/system/console/advanced/components/cmd_system
+      path: C:\esp\v5.5.3\esp-idf\examples\system\console\advanced\components\cmd_system
       type: local
     version: '*'
   esp-qa/ping-cmd:

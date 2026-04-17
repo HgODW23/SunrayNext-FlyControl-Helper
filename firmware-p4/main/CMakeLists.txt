@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "app/service/app_boot.c"
         "wifi_app.c"
+        "wifi_cmd.c"
         "console_app.c"
         "bridge/service/bridge_runtime.cpp"
         "bridge/service/bridge_network_runtime.cpp"

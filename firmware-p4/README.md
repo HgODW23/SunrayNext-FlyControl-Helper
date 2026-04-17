@@ -51,7 +51,12 @@ idf.py flash monitor
 
 | Command | Description |
 | --- | --- |
-| `wifi_set <ssid> <password>` | Connect to a Wi-Fi network |
+| `wifi scan [-s|--sort <rssi|ssid>]` | Scan visible APs and list SSID/RSSI/security/channel/BSSID |
+| `wifi connect <ssid> [<password>] [-b|--bssid <mac>]` | Connect to target Wi-Fi, supports optional BSSID lock |
+| `wifi disconnect` | Disconnect from current Wi-Fi |
+| `wifi status` | Show mode, link, DHCP, IP/mask/gateway, SSID and RSSI |
+| `wifi reconnect` | Reconnect using last successful profile stored in NVS |
+| `wifi mac [<mac>]` | Show current MAC or apply temporary MAC spoofing (until reboot) |
 | `echo <text>` | Echo test input |
 
 ### Network
@@ -83,7 +88,8 @@ idf.py flash monitor
 2. Connect the board to Wi-Fi:
 
    ```text
-   wifi_set <ssid> <password>
+   wifi scan
+   wifi connect <ssid> [password]
    ```
 
 3. Configure the network source:
@@ -98,6 +104,24 @@ idf.py flash monitor
    ```text
    uart_en 1 1
    ```
+
+## Wi-Fi Examples
+
+```text
+wifi scan --sort rssi
+wifi connect MyRouter MyPassword
+wifi connect MyRouter -b AA:BB:CC:DD:EE:FF
+wifi status
+wifi disconnect
+wifi reconnect
+wifi mac
+wifi mac 02:11:22:33:44:55
+```
+
+Notes:
+- Connection success is considered valid only after DHCP IP is acquired.
+- If multiple APs share the same SSID and `-b` is not provided, CLI will list candidates and ask for an index.
+- MAC spoofing is temporary and resets to the hardware default after reboot.
 
 ## MAVLink Notes
 

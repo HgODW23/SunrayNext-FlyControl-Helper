@@ -1,265 +1,528 @@
-/**
- * @file wifi_app.c
- * @brief WiFi 应用层实现
- *
- * @details
- * 本模块实现 WiFi STA 模式的连接管理功能，包括：
- * - WiFi 驱动初始化
- * - 事件处理和连接状态管理
- * - 自动重连机制
- * - IP 地址获取
- *
- * WiFi 实际连接通过 esp_hosted 转发到 ESP32-C5 执行。
- *
- * @author P4 Team
- * @date 2026-03-25
- *
- * @defgroup wifi_app WiFi Application
- * @{
- */
-
 #include "wifi_app.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
+
 #include "esp_event.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 
-/**
- * @brief 日志输出标签
- */
 static const char *TAG = "wifi_app";
 
-/**
- * @brief WiFi 事件组句柄
- *
- * 用于同步 WiFi 连接状态事件。
- */
-static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_CONNECT_FAIL_BIT BIT1
+#define WIFI_CONNECT_CANCEL_BIT BIT2
+#define WIFI_APP_CONNECT_DEFAULT_TIMEOUT_MS 25000
 
-/**
- * @brief WiFi 连接成功事件位
- *
- * 当 WiFi 连接成功或获取到 IP 时设置此位。
- */
-#define WIFI_CONNECTED_BIT  BIT0
-
-/**
- * @brief WiFi 重试计数器
- *
- * 记录当前重连次数。
- */
+static EventGroupHandle_t s_wifi_event_group = NULL;
+static esp_netif_t *s_sta_netif = NULL;
 static int s_retry_num = 0;
-
-/**
- * @brief IP 地址信息
- *
- * 存储从 DHCP 获取的 IP 地址、子网掩码和网关。
- */
+static bool s_started = false;
+static bool s_connecting = false;
 static esp_netif_ip_info_t s_ip_info = {0};
-
-/**
- * @brief IP 获取标志
- *
- * 标记是否已成功获取 IP 地址。
- */
 static bool s_got_ip = false;
 
-/**
- * @brief WiFi 事件处理器
- *
- * @param arg       事件参数（未使用）
- * @param event_base 事件基类（WIFI_EVENT 或 IP_EVENT）
- * @param event_id   事件 ID
- * @param event_data 事件数据指针
- *
- * @details
- * 处理以下事件：
- * - WIFI_EVENT_STA_START: 启动 STA 后发起连接
- * - WIFI_EVENT_STA_DISCONNECTED: 处理断开连接和自动重连
- * - WIFI_EVENT_STA_CONNECTED: 标记连接成功
- * - IP_EVENT_STA_GOT_IP: 获取 IP 地址
- *
- * @note
- * 断开后会根据重试次数决定是否自动重连。
- */
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        s_retry_num = 0;
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < WIFI_MAX_RETRY) {
-            s_retry_num++;
-            ESP_LOGI(TAG, "WiFi 断开，等待 %ds 后重试... (%d/%d)", WIFI_RETRY_DELAY_MS/1000, s_retry_num, WIFI_MAX_RETRY);
-            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
-            esp_wifi_connect();
-            ESP_LOGI(TAG, "已发送重连命令到 C5");
-        } else {
-            ESP_LOGI(TAG, "重连次数超限，停止重试");
-        }
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        ESP_LOGI(TAG, "WiFi STA 连接成功！");
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        s_ip_info = event->ip_info;
-        s_got_ip = true;
-        ESP_LOGI(TAG, "获得 IP:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+#define WIFI_APP_MAC_READY_RETRY 10
+#define WIFI_APP_MAC_READY_DELAY_MS 150
+
+static wifi_app_security_t authmode_to_security(wifi_auth_mode_t authmode) {
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:
+            return WIFI_APP_SECURITY_OPEN;
+        case WIFI_AUTH_WEP:
+            return WIFI_APP_SECURITY_WEP;
+        case WIFI_AUTH_WPA_PSK:
+            return WIFI_APP_SECURITY_WPA;
+        case WIFI_AUTH_WPA2_PSK:
+        case WIFI_AUTH_WPA_WPA2_PSK:
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+        case WIFI_AUTH_WPA3_ENT_192:
+            return WIFI_APP_SECURITY_WPA2;
+        case WIFI_AUTH_WPA3_PSK:
+#ifdef WIFI_AUTH_WAPI_PSK
+        case WIFI_AUTH_WAPI_PSK:
+#endif
+            return WIFI_APP_SECURITY_WPA3;
+        default:
+            return WIFI_APP_SECURITY_UNKNOWN;
     }
 }
 
-esp_err_t wifi_app_init(void)
-{
-    esp_err_t ret = nvs_flash_init();               // 1. 初始化 NVS（WiFi 驱动依赖）
+const char *wifi_app_security_to_string(wifi_app_security_t security) {
+    switch (security) {
+        case WIFI_APP_SECURITY_OPEN:
+            return "OPEN";
+        case WIFI_APP_SECURITY_WEP:
+            return "WEP";
+        case WIFI_APP_SECURITY_WPA:
+            return "WPA";
+        case WIFI_APP_SECURITY_WPA2:
+            return "WPA2";
+        case WIFI_APP_SECURITY_WPA3:
+            return "WPA3";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "Wi-Fi station started");
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_got_ip = false;
+        memset(&s_ip_info, 0, sizeof(s_ip_info));
+        if (s_wifi_event_group != NULL) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+
+        if (!s_connecting) {
+            return;
+        }
+
+        if (s_retry_num < WIFI_MAX_RETRY) {
+            s_retry_num++;
+            ESP_LOGI(TAG,
+                     "Wi-Fi disconnected, retry in %ds (%d/%d)",
+                     WIFI_RETRY_DELAY_MS / 1000,
+                     s_retry_num,
+                     WIFI_MAX_RETRY);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            esp_wifi_connect();
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi retries exhausted");
+            if (s_wifi_event_group != NULL) {
+                xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECT_FAIL_BIT);
+            }
+        }
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        s_retry_num = 0;
+        ESP_LOGI(TAG, "Wi-Fi associated, waiting DHCP");
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_ip_info = event->ip_info;
+        s_got_ip = true;
+        s_retry_num = 0;
+        if (s_wifi_event_group != NULL) {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+static esp_err_t wifi_app_ensure_started(void) {
+    uint8_t mac[6] = {0};
+
+    // If already started, still make sure remote MAC path is ready.
+    if (s_started) {
+        for (int i = 0; i < WIFI_APP_MAC_READY_RETRY; i++) {
+            if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+                return ESP_OK;
+            }
+            vTaskDelay(pdMS_TO_TICKS(WIFI_APP_MAC_READY_DELAY_MS));
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = esp_wifi_start();
+    if (err == ESP_OK) {
+        s_started = true;
+    } else if (err == ESP_ERR_WIFI_CONN) {
+        // Sometimes returned when already started by lower stack.
+        s_started = true;
+        err = ESP_OK;
+    }
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    // On hosted Wi-Fi, MAC fetch may be briefly unavailable right after start.
+    for (int i = 0; i < WIFI_APP_MAC_READY_RETRY; i++) {
+        if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(WIFI_APP_MAC_READY_DELAY_MS));
+    }
+
+    ESP_LOGW(TAG, "Wi-Fi started but remote MAC not ready yet");
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_app_init(void) {
+    esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    ESP_ERROR_CHECK(esp_netif_init());                        // 初始化底层 TCP/IP 堆栈（LwIP）
-    ESP_ERROR_CHECK(esp_event_loop_create_default());         // 创建默认事件循环
-    esp_netif_create_default_wifi_sta();                      // 创建默认的 WIFI STA 网络接口
-    s_wifi_event_group = xEventGroupCreate();                                                                 
-                                                              //  注册 WiFi 事件处理程序
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                &wifi_event_handler, NULL));
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();       // 初始化 WiFi 驱动
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    if (s_sta_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to create station netif");
+        return ESP_FAIL;
+    }
+
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create Wi-Fi event group");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));   // 设置为 STA 模式
-    ESP_LOGI(TAG, "WiFi STA 初始化完成，等待终端输入 wifi_set 命令");
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_country_t country = {
+        .cc = "CN",
+        .schan = 1,
+        .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
+    };
+    esp_err_t country_err = esp_wifi_set_country(&country);
+    if (country_err != ESP_OK) {
+        ESP_LOGW(TAG, "set_country(CN) failed: %s", esp_err_to_name(country_err));
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi initialized (STA)");
     return ESP_OK;
 }
 
-/**
- * @brief 使用指定凭证连接 WiFi
- *
- * @param ssid     WiFi 网络名称（SSID）
- * @param password WiFi 密码
- *
- * @details
- * 配置并启动 WiFi STA 连接：
- * - 停止现有 WiFi 连接（如有）
- * - 设置新的 SSID 和密码（WPA2-PSK / WPA3-SAE）
- * - 启动 WiFi 并等待连接成功
- *
- * @note
- * 连接过程会阻塞，直到连接成功或失败。
- * 自动重连由 wifi_event_handler 处理。
- *
- * @return
- *   - ESP_OK: 连接成功
- *   - ESP_ERR_INVALID_ARG: ssid 或 password 为空
- *   - ESP_FAIL: 连接失败
- *
- * @see wifi_app_init()
- * @see wifi_app_deinit()
- */
-esp_err_t wifi_app_connect_with_creds(const char *ssid, const char *password)
-{
-    if (ssid == NULL || password == NULL) {
-        ESP_LOGE(TAG, "SSID 或 Password 为空");
+esp_err_t wifi_app_scan(wifi_app_scan_result_t *results, size_t max_results, size_t *out_count) {
+    if (results == NULL || out_count == NULL || max_results == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGI(TAG, "正在使用以下凭证连接 WiFi:");
-    ESP_LOGI(TAG, "  SSID: %s", ssid);
+    ESP_RETURN_ON_ERROR(wifi_app_ensure_started(), TAG, "Failed to start Wi-Fi");
 
-    // 停止现有 WiFi（如已运行），忽略"未启动"错误
-    esp_err_t stop_ret = esp_wifi_stop();
-    if (stop_ret != ESP_OK && stop_ret != ESP_ERR_WIFI_NOT_STARTED) {
-        ESP_LOGW(TAG, "esp_wifi_stop 异常: %s", esp_err_to_name(stop_ret));
-    }
-
-    // 构建新的 WiFi 配置
-    wifi_config_t new_config = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .sae_pwe_h2e      = WPA3_SAE_PWE_BOTH,
-            .sae_h2e_identifier = "",
-        },
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
     };
-    strncpy((char *)new_config.sta.ssid,     ssid, sizeof(new_config.sta.ssid) - 1);
-    strncpy((char *)new_config.sta.password, password, sizeof(new_config.sta.password) - 1);
 
-    // 更新配置并启动
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &new_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi STA 已启动，等待连接...");
-
-    // 等待连接成功事件
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        if (s_got_ip) {
-            ESP_LOGI(TAG, "WiFi 连接成功！IP 地址: " IPSTR, IP2STR(&s_ip_info.ip));
-        } else {
-            ESP_LOGI(TAG, "WiFi 连接成功！（DHCP 尚未分配 IP）");
+    esp_err_t err = ESP_OK;
+    uint16_t ap_count = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        err = esp_wifi_scan_start(&scan_cfg, true);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "scan start failed: %s", esp_err_to_name(err));
+            return err;
         }
-        return ESP_OK;
-    } else {
-        ESP_LOGE(TAG, "WiFi 连接失败！");
-        return ESP_FAIL;
+
+        ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&ap_count), TAG, "scan_get_ap_num failed");
+        if (ap_count > 0) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
+
+    uint16_t fetch_count = ap_count;
+    if (fetch_count > max_results) {
+        fetch_count = (uint16_t)max_results;
+    }
+    if (fetch_count == 0) {
+        *out_count = 0;
+        return ESP_OK;
+    }
+
+    wifi_ap_record_t *ap_records = (wifi_ap_record_t *)calloc(fetch_count, sizeof(wifi_ap_record_t));
+    if (ap_records == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = esp_wifi_scan_get_ap_records(&fetch_count, ap_records);
+    if (err != ESP_OK) {
+        free(ap_records);
+        return err;
+    }
+
+    size_t out = 0;
+    for (uint16_t i = 0; i < fetch_count; i++) {
+        if (ap_records[i].ssid[0] == '\0') {
+            continue;
+        }
+        memset(&results[out], 0, sizeof(results[out]));
+        strncpy(results[out].ssid, (const char *)ap_records[i].ssid, sizeof(results[out].ssid) - 1);
+        results[out].rssi = ap_records[i].rssi;
+        results[out].channel = ap_records[i].primary;
+        memcpy(results[out].bssid, ap_records[i].bssid, sizeof(results[out].bssid));
+        results[out].security = authmode_to_security(ap_records[i].authmode);
+        out++;
+    }
+
+    free(ap_records);
+    *out_count = out;
+    return ESP_OK;
 }
 
-/**
- * @brief 获取当前 IP 地址信息
- *
- * @param[out] out_ip 指向 esp_netif_ip_info_t 的指针，用于输出 IP 信息
- *
- * @return
- *   - true:  获取成功，out_ip 已填充
- *   - false: 未获取 IP 或 out_ip 为 NULL
- *
- * @see wifi_app_connect_with_creds()
- */
-bool wifi_app_get_ip_info(esp_netif_ip_info_t *out_ip)
-{
-    if (out_ip == NULL) return false;
-    if (!s_got_ip) return false;
+esp_err_t wifi_app_connect(const wifi_app_connect_params_t *params) {
+    if (params == NULL || params->ssid == NULL || params->ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(wifi_app_ensure_started(), TAG, "Failed to start Wi-Fi");
+
+    wifi_config_t cfg = {0};
+    strncpy((char *)cfg.sta.ssid, params->ssid, sizeof(cfg.sta.ssid) - 1);
+
+    const char *password = (params->password != NULL) ? params->password : "";
+    strncpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
+
+    if (password[0] == '\0') {
+        cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    }
+
+    if (params->use_bssid) {
+        if (params->bssid == NULL) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.sta.bssid_set = true;
+        memcpy(cfg.sta.bssid, params->bssid, 6);
+    }
+
+    esp_wifi_disconnect();
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &cfg), TAG, "set_config failed");
+
+    s_connecting = true;
+    s_retry_num = 0;
+    s_got_ip = false;
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    xEventGroupClearBits(
+        s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_CONNECT_FAIL_BIT | WIFI_CONNECT_CANCEL_BIT);
+
+    ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "wifi_connect failed");
+
+    uint32_t timeout_ms = params->timeout_ms > 0 ? params->timeout_ms : WIFI_APP_CONNECT_DEFAULT_TIMEOUT_MS;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_CONNECT_FAIL_BIT | WIFI_CONNECT_CANCEL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(timeout_ms));
+
+    s_connecting = false;
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        return ESP_OK;
+    }
+
+    if (bits & WIFI_CONNECT_FAIL_BIT) {
+        return ESP_FAIL;
+    }
+    if (bits & WIFI_CONNECT_CANCEL_BIT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGW(TAG, "connect timeout waiting DHCP (%lu ms)", (unsigned long)timeout_ms);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_app_cancel_connect(void) {
+    if (!s_connecting) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_connecting = false;
+    s_got_ip = false;
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    if (s_wifi_event_group != NULL) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECT_CANCEL_BIT);
+    }
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err == ESP_ERR_WIFI_NOT_INIT || err == ESP_ERR_WIFI_NOT_STARTED) {
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t wifi_app_connect_with_creds(const char *ssid, const char *password) {
+    wifi_app_connect_params_t params = {
+        .ssid = ssid,
+        .password = password,
+        .bssid = NULL,
+        .use_bssid = false,
+        .timeout_ms = WIFI_APP_CONNECT_DEFAULT_TIMEOUT_MS,
+    };
+    return wifi_app_connect(&params);
+}
+
+esp_err_t wifi_app_disconnect(void) {
+    s_connecting = false;
+    s_got_ip = false;
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    if (s_wifi_event_group != NULL) {
+        xEventGroupClearBits(
+            s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_CONNECT_FAIL_BIT | WIFI_CONNECT_CANCEL_BIT);
+    }
+    esp_err_t err = esp_wifi_disconnect();
+    if (err == ESP_ERR_WIFI_NOT_INIT || err == ESP_ERR_WIFI_NOT_STARTED) {
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t wifi_app_reconnect(void) {
+    ESP_RETURN_ON_ERROR(wifi_app_ensure_started(), TAG, "Failed to start Wi-Fi");
+
+    s_connecting = true;
+    s_retry_num = 0;
+    s_got_ip = false;
+    memset(&s_ip_info, 0, sizeof(s_ip_info));
+    xEventGroupClearBits(
+        s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_CONNECT_FAIL_BIT | WIFI_CONNECT_CANCEL_BIT);
+
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        s_connecting = false;
+        return err;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_CONNECT_FAIL_BIT | WIFI_CONNECT_CANCEL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(WIFI_APP_CONNECT_DEFAULT_TIMEOUT_MS));
+    s_connecting = false;
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        return ESP_OK;
+    }
+    if (bits & WIFI_CONNECT_FAIL_BIT) {
+        return ESP_FAIL;
+    }
+    if (bits & WIFI_CONNECT_CANCEL_BIT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t wifi_app_get_status(wifi_app_status_t *out_status) {
+    if (out_status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out_status, 0, sizeof(*out_status));
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err == ESP_OK) {
+        out_status->mode = mode;
+    }
+
+    wifi_ap_record_t ap_info = {0};
+    err = esp_wifi_sta_get_ap_info(&ap_info);
+    if (err == ESP_OK) {
+        out_status->connected = true;
+        strncpy(out_status->ssid, (const char *)ap_info.ssid, sizeof(out_status->ssid) - 1);
+        out_status->rssi = ap_info.rssi;
+        memcpy(out_status->bssid, ap_info.bssid, sizeof(out_status->bssid));
+    }
+
+    out_status->started = s_started;
+    out_status->got_ip = s_got_ip;
+    out_status->ip_info = s_ip_info;
+
+    esp_wifi_get_mac(WIFI_IF_STA, out_status->mac);
+
+    return ESP_OK;
+}
+
+esp_err_t wifi_app_get_mac(uint8_t out_mac[6]) {
+    if (out_mac == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_wifi_get_mac(WIFI_IF_STA, out_mac);
+}
+
+esp_err_t wifi_app_set_mac_temporary(const uint8_t mac[6]) {
+    if (mac == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool was_connected = wifi_app_is_connected();
+    if (was_connected) {
+        esp_wifi_disconnect();
+    }
+
+    ESP_RETURN_ON_ERROR(wifi_app_ensure_started(), TAG, "Failed to start Wi-Fi");
+    esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, mac);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (was_connected) {
+        return wifi_app_reconnect();
+    }
+
+    return ESP_OK;
+}
+
+bool wifi_app_get_ip_info(esp_netif_ip_info_t *out_ip) {
+    if (out_ip == NULL) {
+        return false;
+    }
+    if (!s_got_ip) {
+        return false;
+    }
     *out_ip = s_ip_info;
     return true;
 }
 
-/**
- * @brief 释放 WiFi 资源
- *
- * @details
- * 停止 WiFi、释放驱动资源、删除事件组。
- * 重置 IP 获取状态和 IP 信息。
- */
-void wifi_app_deinit(void)
-{
+void wifi_app_deinit(void) {
     esp_wifi_stop();
     esp_wifi_deinit();
-    vEventGroupDelete(s_wifi_event_group);
+
+    if (s_wifi_event_group != NULL) {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = NULL;
+    }
+
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+
+    s_started = false;
+    s_connecting = false;
     s_got_ip = false;
     memset(&s_ip_info, 0, sizeof(s_ip_info));
 }
 
-bool wifi_app_is_connected(void)
-{
+bool wifi_app_is_connected(void) {
     return s_got_ip;
 }
-
-/** @} */ // end of wifi_app group
